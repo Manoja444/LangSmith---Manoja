@@ -13,8 +13,8 @@ services:
     image: minio/minio
     command: server /data --address :9000 --console-address :9001
     ports:
-      - "9002:9000"
-      - "9003:9001"
+      - "9004:9060"
+      - "9005:9007"
     environment:
       MINIO_ROOT_USER: minioadmin1
       MINIO_ROOT_PASSWORD: minioadmin1
