@@ -1,0 +1,51 @@
+[
+  {
+    "trace_id": "944ce838-b5c5-4628-8f23-089fbda8b9e3",
+    "name": "Weather Query",
+    "inputs": {"query": "What is the weather in San Francisco?"},
+    "outputs": {"response": "It is currently 65°F and sunny in San Francisco."},
+    "metadata": {"model": "gpt-4", "temperature": 0.7, "tokens": 42}
+  },
+  {
+    "trace_id": "bc57c8b5-b3a8-46ff-a26e-0e30f7ec9aed",
+    "name": "Translation Task",
+    "inputs": {"text": "Hello world", "target_language": "Spanish"},
+    "outputs": {"translated_text": "Hola mundo"},
+    "metadata": {"model": "gpt-3.5", "temperature": 0.3, "tokens": 15}
+  },
+  {
+    "trace_id": "386725b2-576c-49c7-80ee-2b00c154913e",
+    "name": "Code Generation",
+    "inputs": {"prompt": "Write a function to calculate fibonacci numbers"},
+    "outputs": {"code": "def fibonacci(n):\n    if n <= 1:\n        return n\n    return fibonacci(n-1) + fibonacci(n-2)"},
+    "metadata": {"model": "codex", "temperature": 0.2, "tokens": 78}
+  },
+  {
+    "trace_id": "b8abad02-5fdb-4fb8-9e3d-cdf80fa629ca",
+    "name": "Summarization",
+    "inputs": {"text": "Long article about quantum computing and its applications..."},
+    "outputs": {"summary": "Quantum computing uses quantum bits to perform complex calculations faster than classical computers."},
+    "metadata": {"model": "gpt-4", "temperature": 0.4, "tokens": 120}
+  },
+  {
+    "trace_id": "86555fb9-fbba-4c06-8261-d8dc20fabec4",
+    "name": "Sentiment Analysis",
+    "inputs": {"text": "I absolutely love this product! It exceeded all my expectations."},
+    "outputs": {"sentiment": "positive", "score": 0.92},
+    "metadata": {"model": "sentiment-analyzer-v2", "tokens": 25}
+  },
+  {
+    "trace_id": "ed32861b-a632-4712-a18f-31c5cf50dd13",
+    "name": "Image Description",
+    "inputs": {"image_url": "https://example.com/sunset.jpg"},
+    "outputs": {"description": "A beautiful sunset over the ocean with orange and purple hues."},
+    "metadata": {"model": "vision-model", "tokens": 35}
+  },
+  {
+    "trace_id": "e7400d5e-386c-4fb6-875d-a9e6946039a8",
+    "name": "Question Answering",
+    "inputs": {"question": "Who was the first person to walk on the moon?", "context": "Apollo 11 mission history"},
+    "outputs": {"answer": "Neil Armstrong", "confidence": 0.98},
+    "metadata": {"model": "gpt-4", "temperature": 0.1, "tokens": 45}
+  }
+]
