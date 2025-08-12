@@ -1,6 +1,8 @@
 import asyncio
 import uuid
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
+import io
+import time
 
 import asyncpg
 import orjson
@@ -12,6 +14,32 @@ from pydantic import UUID4, BaseModel, Field
 from ls_py_handler.config.settings import settings
 
 router = APIRouter(prefix="/runs", tags=["runs"])
+
+# -------------------------
+# Simple in-process cache
+# -------------------------
+class _CacheItem:
+    __slots__ = ("value", "expires_at")
+    def __init__(self, value, ttl_sec: int):
+        self.value = value
+        self.expires_at = time.time() + ttl_sec
+
+_cache: Dict[str, _CacheItem] = {}
+_CACHE_TTL_SEC = 30
+_CACHE_MAX = 512  # basic LRU-ish cap
+
+def _cache_get(k: str):
+    it = _cache.get(k)
+    if not it or it.expires_at < time.time():
+        _cache.pop(k, None)
+        return None
+    return it.value
+
+def _cache_put(k: str, v):
+    if len(_cache) > _CACHE_MAX:
+        # drop an arbitrary item (good enough for a lightweight cache)
+        _cache.pop(next(iter(_cache)))
+    _cache[k] = _CacheItem(v, _CACHE_TTL_SEC)
 
 
 class Run(BaseModel):
@@ -49,6 +77,23 @@ async def get_s3_client():
         yield client
 
 
+def _ndjson_bytes_and_offsets(run_dicts: List[Dict[str, Any]]) -> Tuple[bytes, List[Tuple[int, int]]]:
+    """
+    Build NDJSON buffer where each run is one line: b'{"..."}\n'
+    Returns (buffer_bytes, [(start,end_exclusive) per run]).
+    """
+    buf = io.BytesIO()
+    offsets: List[Tuple[int, int]] = []
+    cursor = 0
+    for rd in run_dicts:
+        line = orjson.dumps(rd) + b"\n"
+        start = cursor
+        buf.write(line)
+        cursor += len(line)
+        offsets.append((start, cursor))  # end is exclusive
+    return buf.getvalue(), offsets
+
+
 @router.post("", status_code=status.HTTP_201_CREATED)
 async def create_runs(
     runs: List[Run],
@@ -58,60 +103,56 @@ async def create_runs(
     if not runs:
         raise HTTPException(status_code=400, detail="No runs provided")
 
+    # 1) Prepare NDJSON batch (single serialization pass)
     batch_id = str(uuid.uuid4())
-    run_dicts = [run.model_dump() for run in runs]
-    batch_data = orjson.dumps(run_dicts)
-    object_key = f"batches/{batch_id}.json"
+    object_key = f"batches/{batch_id}.ndjson"
+    run_dicts = [r.model_dump() for r in runs]
+    ndjson_bytes, offsets = _ndjson_bytes_and_offsets(run_dicts)
 
+    # 2) Upload once to S3
     await s3.put_object(
         Bucket=settings.S3_BUCKET_NAME,
         Key=object_key,
-        Body=batch_data,
-        ContentType="application/json",
+        Body=ndjson_bytes,
+        ContentType="application/x-ndjson",
     )
 
-    created_runs = []
+    # 3) Bulk insert rows with (id, trace_id, name, s3_key, byte_start, byte_end)
+    #    Much faster than per-row INSERT.
+    records = []
+    for r, (start, end) in zip(runs, offsets):
+        records.append((
+            str(r.id),             # id (uuid as text; PG will cast if column is uuid)
+            str(r.trace_id),
+            r.name,
+            object_key,
+            start,
+            end,
+        ))
 
-    for i, run in enumerate(runs):
-        run_dict = run_dicts[i]
-        field_refs = {}
-        for field in ["inputs", "outputs", "metadata"]:
-            field_json_data = orjson.dumps(run_dict.get(field, {}))
-            field_start_in_run = batch_data.find(field_json_data)
-            if field_start_in_run != -1:
-                field_start = field_start_in_run
-                field_end = field_start + len(field_json_data)
-                field_refs[field] = (
-                    f"s3://{settings.S3_BUCKET_NAME}/{object_key}"
-                    f"#{field_start}:{field_end}/{field}"
-                )
-            else:
-                field_refs[field] = ""
-
-        run_id = await db.fetchval(
-            """
-            INSERT INTO runs (id, trace_id, name, inputs, outputs, metadata)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            RETURNING id
-            """,
-            run.id,
-            run.trace_id,
-            run.name,
-            field_refs["inputs"],
-            field_refs["outputs"],
-            field_refs["metadata"],
+    async with db.transaction():
+        await db.copy_records_to_table(
+            "runs",
+            records=records,
+            columns=["id", "trace_id", "name", "s3_key", "byte_start", "byte_end"],
         )
 
-        created_runs.append({
-            "id": str(run_id),
-            "trace_id": str(run.trace_id),
-            "name": run.name,
-            "inputs": run.inputs,
-            "outputs": run.outputs,
-            "metadata": run.metadata
-        })
+    # 4) Return full runs with server-assigned IDs (already set) — no re-serialization needed
+    created = [{
+        "id": str(r.id),
+        "trace_id": str(r.trace_id),
+        "name": r.name,
+        "inputs": r.inputs,
+        "outputs": r.outputs,
+        "metadata": r.metadata,
+    } for r in runs]
 
-    return ORJSONResponse(content=created_runs)
+    # Optional: prime cache by id for quick GETs (best effort)
+    for item, (start, end) in zip(created, offsets):
+        # store object_key + slice in cache so GET can short-circuit S3
+        _cache_put(f"run:{item['id']}", item)
+
+    return ORJSONResponse(content=created)
 
 
 @router.get("/{run_id}", status_code=status.HTTP_200_OK)
@@ -120,61 +161,44 @@ async def get_run(
     db: asyncpg.Connection = Depends(get_db_conn),
     s3: Any = Depends(get_s3_client),
 ):
+    # 0) Cache
+    ck = f"run:{run_id}"
+    cached = _cache_get(ck)
+    if cached:
+        return ORJSONResponse(content=cached)
+
+    # 1) Fetch the run pointer only (cheap)
     row = await db.fetchrow(
         """
-        SELECT id, trace_id, name, inputs, outputs, metadata
+        SELECT id, trace_id, name, s3_key, byte_start, byte_end
         FROM runs
         WHERE id = $1
         """,
         run_id,
     )
-
     if not row:
         raise HTTPException(status_code=404, detail=f"Run with ID {run_id} not found")
 
-    run_data = dict(row)
+    s3_key = row["s3_key"]
+    start = int(row["byte_start"])
+    end = int(row["byte_end"])  # exclusive
 
-    def parse_s3_ref(ref):
-        if not ref or not ref.startswith("s3://"):
-            return None, None, None, None
-        parts = ref.split("/")
-        bucket = parts[2]
-        key = "/".join(parts[3:]).split("#")[0]
-        if "#" in ref:
-            offset_part = ref.split("#")[1]
-            if ":" in offset_part and "/" in offset_part:
-                offsets, field = offset_part.split("/")
-                start_offset, end_offset = map(int, offsets.split(":"))
-                return bucket, key, (start_offset, end_offset), field
-        return bucket, key, None, None
+    # 2) Single range GET for exactly this run’s JSON line
+    byte_range = f"bytes={start}-{end-1}"  # Range is inclusive end
+    try:
+        resp = await s3.get_object(Bucket=settings.S3_BUCKET_NAME, Key=s3_key, Range=byte_range)
+        async with resp["Body"] as stream:
+            data = await stream.read()
+        # Strip trailing newline if present (NDJSON line)
+        if data.endswith(b"\n"):
+            data = data[:-1]
+        run_obj = orjson.loads(data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to fetch run data: {e}")
 
-    async def fetch_from_s3(ref):
-        if not ref or not ref.startswith("s3://"):
-            return {}
-        bucket, key, offsets, field = parse_s3_ref(ref)
-        if not bucket or not key or not offsets:
-            return {}
-        start_offset, end_offset = offsets
-        byte_range = f"bytes={start_offset}-{end_offset-1}"
-        try:
-            response = await s3.get_object(Bucket=bucket, Key=key, Range=byte_range)
-            async with response["Body"] as stream:
-                data = await stream.read()
-            return orjson.loads(data)
-        except Exception:
-            return {}
+    # 3) Normalize ids to strings for JSON
+    run_obj["id"] = str(run_obj.get("id", run_id))
+    run_obj["trace_id"] = str(run_obj["trace_id"])
 
-    inputs, outputs, metadata = await asyncio.gather(
-        fetch_from_s3(run_data["inputs"]),
-        fetch_from_s3(run_data["outputs"]),
-        fetch_from_s3(run_data["metadata"]),
-    )
-
-    return ORJSONResponse(content={
-        "id": str(run_data["id"]),
-        "trace_id": str(run_data["trace_id"]),
-        "name": run_data["name"],
-        "inputs": inputs,
-        "outputs": outputs,
-        "metadata": metadata,
-    })
+    _cache_put(ck, run_obj)
+    return ORJSONResponse(content=run_obj)
