@@ -142,7 +142,6 @@ async def _ensure_db_schema(pool: asyncpg.Pool) -> None:
             try:
                 await conn.execute(sql)
             except Exception as e:
-                # log and continue; the goal is to be self-healing
                 logger.debug("Migration step ignored error: %s", e)
 
 # ------------ models ------------
@@ -192,6 +191,13 @@ def _ndjson_bytes_and_offsets(run_dicts: List[Dict[str, Any]]) -> Tuple[bytes, L
 async def _s3_get_range(s3: Any, sem: asyncio.Semaphore, *, bucket: str, key: str, start: int, end_exclusive: int) -> bytes:
     async with sem:
         resp = await s3.get_object(Bucket=bucket, Key=key, Range=f"bytes={start}-{end_exclusive-1}")
+        async with resp["Body"] as stream:
+            return await stream.read()
+
+async def _s3_get_full(s3: Any, sem: asyncio.Semaphore, *, bucket: str, key: str) -> bytes:
+    """Fetch the entire object (no Range) and return raw bytes."""
+    async with sem:
+        resp = await s3.get_object(Bucket=bucket, Key=key)
         async with resp["Body"] as stream:
             return await stream.read()
 
@@ -440,14 +446,52 @@ async def get_run(
     byte_start = int(row["byte_start"])
     byte_end = int(row["byte_end"])
 
-    data = await _with_timeout(
-        _s3_get_range(s3, s3_sem, bucket=settings.S3_BUCKET_NAME, key=s3_key, start=byte_start, end_exclusive=byte_end),
-        10.0,
-        "S3 read timed out",
-    )
+    # Detect gzip and choose the correct read path
+    try:
+        head = await _with_timeout(
+            s3.head_object(Bucket=settings.S3_BUCKET_NAME, Key=s3_key),
+            5.0,
+            "S3 head timed out",
+        )
+        content_encoding = (head.get("ContentEncoding") or "").lower()
+    except ClientError:
+        content_encoding = ""
+
+    if content_encoding == "gzip":
+        # Whole-object download, then decompress, then slice on UNCOMPRESSED bytes.
+        blob = await _with_timeout(
+            _s3_get_full(s3, s3_sem, bucket=settings.S3_BUCKET_NAME, key=s3_key),
+            20.0,
+            "S3 read timed out",
+        )
+        try:
+            raw = gzip.decompress(blob)
+        except Exception:
+            # If the object isn't actually gzipped (edge case), use as-is
+            raw = blob
+        data = raw[byte_start:byte_end]
+    else:
+        # Not compressed → ranged read aligns with stored offsets.
+        data = await _with_timeout(
+            _s3_get_range(
+                s3, s3_sem,
+                bucket=settings.S3_BUCKET_NAME,
+                key=s3_key,
+                start=byte_start,
+                end_exclusive=byte_end,
+            ),
+            10.0,
+            "S3 read timed out",
+        )
+
     if data.endswith(b"\n"):
         data = data[:-1]
-    run_obj = orjson.loads(data)
+
+    try:
+        run_obj = orjson.loads(data)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Corrupt run slice for {run_id}: {e}")
+
     run_obj["id"] = str(run_obj.get("id", run_id))
     run_obj["trace_id"] = str(run_obj["trace_id"])
     _cache.put(ck, run_obj)
