@@ -1,23 +1,24 @@
 services:
-  db-postgres-15:
-    image: postgres:15.10
+  db-postgres-17:
+    image: postgres:17.6
     shm_size: 1g
     restart: always
     environment:
       POSTGRES_PASSWORD: postgres
     ports:
-      - '5432:5432'
+      - "5432:5432"
     volumes:
-      - ./.data/postgres:/var/lib/postgresql/data
+      - ./.data/postgres:/var/lib/postgresql17/data
+
   minio:
     image: minio/minio
     command: server /data --address :9000 --console-address :9001
     ports:
-      - "9004:9060"
-      - "9005:9007"
+      - "9000:9000"   # MinIO API
+      - "9001:9001"   # MinIO Console
     environment:
       MINIO_ROOT_USER: minioadmin1
       MINIO_ROOT_PASSWORD: minioadmin1
-    volumes:
-      - ./.data/minio:/data
+   # volumes:
+    #  - ./.data/minio1:/data
     restart: always

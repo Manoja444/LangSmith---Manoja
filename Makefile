@@ -2,7 +2,7 @@
 
 # Start all database services defined in docker-compose-db.yaml
 db-up:
-	docker-compose -f docker-compose-db.yaml --profile postgres-15 up -d
+	docker-compose -f docker-compose-db.yaml --profile postgres-17 up -d
 
 # Stop all database services defined in docker-compose-db.yaml
 db-down:
@@ -22,7 +22,23 @@ db-downgrade:
 
 # Run migrations and start the server
 server: db-migrate
-	poetry run uvicorn ls_py_handler.main:app --reload
+	# set the exact values your MinIO is using
+export S3_ENDPOINT_URL=http://localhost:9000
+export S3_ACCESS_KEY=minioadmin1
+export S3_SECRET_KEY=minioadmin1
+export S3_REGION=us-east-1
+
+# (optional) also set AWS-style vars, just in case
+export AWS_ACCESS_KEY_ID=minioadmin1
+export AWS_SECRET_ACCESS_KEY=minioadmin1
+export AWS_DEFAULT_REGION=us-east-1
+
+# VERY IMPORTANT: ensure you are NOT in test mode (this would read .env.test instead)
+unset RUN_HANDLER_ENV
+
+# now start the app from this same shell
+poetry run uvicorn ls_py_handler.main:app --reload
+
 
 # Format code using Ruff
 format:

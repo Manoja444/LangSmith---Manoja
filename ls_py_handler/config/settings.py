@@ -26,7 +26,7 @@ class Settings(BaseSettings):
 
     # S3/MinIO settings
     S3_BUCKET_NAME: str = "runs"
-    S3_ENDPOINT_URL: str = "http://localhost:9002"
+    S3_ENDPOINT_URL: str = "http://localhost:9000"
     S3_ACCESS_KEY: str = "minioadmin1"
     S3_SECRET_KEY: str = "minioadmin1"
     S3_REGION: str = "us-east-1"
